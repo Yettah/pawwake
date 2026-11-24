@@ -189,12 +189,27 @@ async def health_check():
 
 
 @router.get("/v1/models")
-async def list_models():
+async def list_models(request: Request):
     """模型列表（让客户端不报错）"""
+    from character_gateway import credential
+    from character_registry import resolve_character
+    from db.core import get_pool
+    if credential(request):
+        async with (await get_pool()).acquire() as conn:
+            if await resolve_character(conn, credential(request)) is None:
+                return JSONResponse(status_code=401, content={"error":"Invalid character key"})
+    model = shared.DEFAULT_MODEL
+    if credential(request):
+        from character_settings import load
+        async with (await get_pool()).acquire() as conn:
+            cid = await resolve_character(conn, credential(request))
+            if cid is None:
+                return JSONResponse(status_code=401, content={"error":"Invalid character key"})
+            model = (await load(conn,cid)).get('chat_model') or model
     models = []
-    if shared.DEFAULT_MODEL:
+    if model:
         models.append({
-            "id": shared.DEFAULT_MODEL,
+            "id": model,
             "object": "model",
             "created": 1700000000,
             "owned_by": "pawwake",
@@ -208,6 +223,9 @@ async def list_models():
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """核心转发接口"""
+    from character_gateway import credential
+    if credential(request):
+        return await character_chat(request)
     if not shared.API_KEY:
         return JSONResponse(
             status_code=500,
@@ -723,3 +741,74 @@ async def _stream_and_capture_inner(
                                         tool_messages=tool_messages, assistant_tool_calls=assistant_tool_calls,
                                         assistant_reasoning=assistant_reasoning)
         )
+
+
+async def character_chat(request):
+    from character_gateway import credential, prepare, persist, stream_reply, extract_with_model, session_id
+    from character_memory import CharacterMemory
+    from character_settings import load
+    from character_registry import resolve_character
+    from character_storage import CharacterStorage
+    import os
+    from character_security import tenant_scope
+    from db.core import get_pool
+    try:
+        raw_body = await request.json()
+        if not isinstance(raw_body, dict): raise ValueError("invalid body")
+        session = session_id(raw_body.get("session_id", "default"))
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            identity = await resolve_character(conn, credential(request))
+            if identity is None: raise PermissionError('invalid character key')
+            async with tenant_scope(conn,identity):
+                settings = await load(conn, identity)
+                settings.setdefault('memory_enabled', shared.MEMORY_ENABLED)
+                if shared.MEMORY_VECTOR_ENABLED and shared.EMBEDDING_API_KEY and settings.get('memory_enabled', shared.MEMORY_ENABLED):
+                    from character_vectors import SemanticRecall
+                    async with httpx.AsyncClient(timeout=15) as embedding_client:
+                        semantic = SemanticRecall(embedding_client, shared.EMBEDDING_BASE_URL, shared.EMBEDDING_API_KEY, settings.get('embedding_model', shared.EMBEDDING_MODEL), shared.EMBEDDING_DIM)
+                        cid, body, user = await prepare(conn, credential(request), raw_body, semantic, settings, session=session)
+                else:
+                    cid, body, user = await prepare(conn, credential(request), raw_body, settings=settings, session=session)
+        body['model'] = settings.get('chat_model') or body.get('model') or shared.DEFAULT_MODEL
+        for field in ('temperature','max_tokens'):
+            if field in settings: body[field]=settings[field]
+        if not body['model'] or not shared.API_KEY:
+            return JSONResponse(status_code=503, content={'error':'Upstream not configured'})
+        url, key = shared.API_BASE_URL, shared.API_KEY
+        memory_model = settings.get('memory_model', os.getenv('MEMORY_MODEL', ''))
+        memory_key = shared.MEMORY_API_KEY or key
+        async def save(answer):
+            async with pool.acquire() as conn:
+                async with tenant_scope(conn,cid):
+                    await persist(conn,cid,user,answer,session)
+                    if settings.get("memory_enabled", shared.MEMORY_ENABLED) and settings.get("extraction_enabled", True) and memory_model:
+                        from character_jobs import enqueue
+                        await enqueue(conn,cid,session)
+        if body.get('stream'):
+            completed = False
+            async def save_stream(answer):
+                nonlocal completed
+                await save(answer)
+                completed = True
+            async def generate():
+                async with httpx.AsyncClient(timeout=300) as client:
+                    async for chunk in stream_reply(client,url,{'Authorization':'Bearer '+key},body,save_stream):
+                        yield chunk
+            return StreamingResponse(generate(),media_type='text/event-stream')
+        async with httpx.AsyncClient(timeout=300) as client:
+            response = await client.post(url, headers={'Authorization':'Bearer '+key}, json=body)
+        if response.status_code != 200:
+            return JSONResponse(status_code=502, content={'error':'Upstream request failed'})
+        data = response.json()
+        answer = data['choices'][0]['message']['content']
+        if not isinstance(answer,str):
+            raise ValueError('Unsupported upstream response')
+        await save(answer)
+        return JSONResponse(content=data)
+    except PermissionError:
+        return JSONResponse(status_code=401, content={'error':'Invalid character key'})
+    except ValueError:
+        return JSONResponse(status_code=400, content={'error':'Invalid or unsupported text chat request'})
+    except Exception:
+        return JSONResponse(status_code=503, content={'error':'Character gateway unavailable'})

@@ -90,10 +90,25 @@ async def gateway_auth_middleware(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
 
+    from character_gateway import credential, enabled
+    if path in {"/character-mcp", "/character-mcp/"}:
+        return await call_next(request)  # dedicated ASGI auth validates every request
+    if credential(request):
+        if enabled() and path in {"/v1/chat/completions", "/v1/models"}:
+            return await call_next(request)  # route validates key before any work
+        return JSONResponse(status_code=401, content={"error": "Character credential not permitted"})
+
     # 程序调用只接受请求头，不让主密钥进入 URL、浏览器历史或前端脚本。
     provided_key = request.headers.get("X-Gateway-Key", "")
     if shared.GATEWAY_SECRET and secrets.compare_digest(provided_key, shared.GATEWAY_SECRET):
         return await call_next(request)
+
+    # OpenAI-compatible clients use Bearer authentication. Restrict this
+    # spelling to chat and model listing; never grant Dashboard privileges.
+    if path in {"/v1/chat/completions", "/v1/models"} and shared.GATEWAY_SECRET:
+        scheme, separator, token = request.headers.get("Authorization", "").partition(" ")
+        if separator and scheme.lower() == "bearer" and secrets.compare_digest(token.strip(), shared.GATEWAY_SECRET):
+            return await call_next(request)
 
     # MCP clients commonly support Bearer but not custom headers. This alternate spelling
     # stays scoped to /mcp and uses the same secret as X-Gateway-Key.

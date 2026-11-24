@@ -1,0 +1,26 @@
+# Reference only: manually create a NEW test service, never apply to production.
+services:
+  - type: web
+    name: pawwake-multi-test
+    runtime: docker
+    branch: multi-character
+    plan: free
+    healthCheckPath: /
+    autoDeployTrigger: "off"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: GATEWAY_SECRET
+        generateValue: true
+      - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATABASE_ENABLED
+        value: "true"
+      - key: MEMORY_ENABLED
+        value: "true"
+      - key: MULTI_CHARACTER_ENABLED
+        value: "true"
+      - key: MULTI_RLS_ENABLED
+        value: "true"

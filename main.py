@@ -28,12 +28,16 @@ from db import conversations as db_conversations
 from db import memories as db_memories
 from routes.chat import router as chat_router
 from routes.dashboard import router as dashboard_router, settings_router
+from routes.characters import router as characters_router
 from routes.memories import bootstrap_router as memories_bootstrap_router
 from routes.memories import maintenance_router as memories_maintenance_router
 from routes.memories import router as memories_router
 from routes.conversations import router as conversations_router
 from routes.partition import router as partition_router
 from mcp_server import http_app as mcp_http_app, server as mcp_server
+from character_mcp import build_server, CharacterMCPAuth
+character_mcp_server = build_server()
+character_mcp_app = character_mcp_server.streamable_http_app(streamable_http_path="/", stateless_http=True, json_response=True, host="0.0.0.0")
 
 # ============================================================
 # 应用生命周期管理
@@ -49,6 +53,9 @@ async def gateway_lifespan(app: FastAPI):
             "MAX_MEMORIES_INJECT=0 停止自动注入"
         )
     if not shared.DATABASE_ENABLED:
+        from character_gateway import enabled
+        if enabled():
+            raise RuntimeError("Multi-character mode requires database persistence")
         print("ℹ️  数据库总闸已关闭；跳过数据库初始化并进入纯转发模式")
         yield
         return
@@ -56,6 +63,18 @@ async def gateway_lifespan(app: FastAPI):
     db_search.pause_embedding_state("向量状态尚未加载")
     try:
         await db_core.init_tables()
+        from character_gateway import enabled
+        if enabled():
+            import character_registry, character_storage
+            async with (await db_core.get_pool()).acquire() as conn:
+                async with conn.transaction():
+                    await character_registry.initialize(conn)
+                    await character_storage.initialize(conn)
+                    from character_jobs import DDL as jobs_ddl
+                    await conn.execute(jobs_ddl)
+                    if __import__("os").getenv("MULTI_RLS_ENABLED", "").lower() == "true":
+                        from character_security import install_policies
+                        await install_policies(conn)
         await db_conversations.ensure_token_usage_table()
 
         # 从数据库恢复面板配置。这一步不能受 MEMORY_ENABLED 控制，
@@ -127,20 +146,32 @@ async def gateway_lifespan(app: FastAPI):
         if shared.CACHE_PARTITION_ENABLED:
             print(f"🔒 分区缓存已启用: X={shared.CACHE_PARTITION_X}, 摘要模型={shared.CACHE_SUMMARY_MODEL or '（未配置，纯轮转模式）'}")
     except Exception as e:
+        if __import__("os").getenv("MULTI_CHARACTER_ENABLED", "").lower() == "true" or __import__("os").getenv("MULTI_RLS_ENABLED", "").lower() == "true":
+            raise RuntimeError("Multi-character database initialization failed") from None
         print(f"⚠️  数据库初始化失败: {e}")
         if shared.CACHE_PARTITION_ENABLED:
             print("⚠️  分区缓存需要数据库；聊天请求将返回 503，避免丢失历史")
         else:
             print("⚠️  持久化配置与记忆能力暂停；网关继续纯转发")
     
-    yield
-    
-    await db_core.close_pool()
+    import asyncio
+    from character_gateway import enabled
+    task = None
+    if enabled():
+        from character_jobs import worker, configured_adapter
+        task = asyncio.create_task(worker(await db_core.get_pool(), configured_adapter))
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await db_core.close_pool()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with mcp_server.session_manager.run():
+    async with mcp_server.session_manager.run(), character_mcp_server.session_manager.run():
         async with gateway_lifespan(app):
             yield
 
@@ -149,13 +180,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pawwake", version="4.2.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/mcp", mcp_http_app, name="mcp")
+app.mount("/character-mcp", CharacterMCPAuth(character_mcp_app), name="character-mcp")
 
 
 async def normalize_mcp_path(request, call_next):
     """Serve /mcp directly so auth headers never cross a redirect."""
-    if request.scope.get("path") == "/mcp":
-        request.scope["path"] = "/mcp/"
-        request.scope["raw_path"] = b"/mcp/"
+    if request.scope.get("path") in {"/mcp", "/character-mcp"}:
+        path = request.scope["path"] + "/"
+        request.scope["path"] = path
+        request.scope["raw_path"] = path.encode()
     return await call_next(request)
 
 
@@ -167,6 +200,7 @@ app.include_router(chat_router)
 database_dependencies = [Depends(auth.require_database_enabled)]
 app.include_router(memories_bootstrap_router, dependencies=database_dependencies)
 app.include_router(dashboard_router)
+app.include_router(characters_router)
 app.include_router(memories_router, dependencies=database_dependencies)
 app.include_router(conversations_router, dependencies=database_dependencies)
 app.include_router(partition_router, dependencies=database_dependencies)

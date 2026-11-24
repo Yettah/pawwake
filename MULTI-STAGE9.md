@@ -1,0 +1,1 @@
+Stage 9: opt-in exact duplicate maintenance, preview, transactional archive and restore. Core memories excluded. No automatic scheduling, semantic merge, conflict resolution, dashboard or real PostgreSQL test. Restored memories receive new IDs; vectors are regenerated on recall. Archive retains text until character deletion. Application-level scoping only.
